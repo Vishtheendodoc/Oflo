@@ -1,4 +1,5 @@
-  streamlit
+  flask
+  flask-cors
   pandas
-  requests
-  streamlit-autorefresh
+  websocket-client
+  dhanhq
