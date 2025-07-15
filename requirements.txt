@@ -2,4 +2,4 @@ flask
 flask-cors
 pandas
 websocket-client
-dhanhq==2.0.2
+git+https://github.com/dhan-oss/DhanHQ-py.git@main#egg=dhanhq
