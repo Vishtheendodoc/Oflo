@@ -2,4 +2,4 @@ flask
 flask-cors
 pandas
 websocket-client
-dhanhq>=2.0.2
+dhanhq>=2.1.0
