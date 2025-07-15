@@ -1,5 +1,5 @@
-  flask
-  flask-cors
-  pandas
-  websocket-client
-  dhanhq
+flask
+flask-cors
+pandas
+websocket-client
+dhanhq>=2.0.2
