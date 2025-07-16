@@ -38,7 +38,15 @@ def get_instrument_list():
     with open(STOCK_LIST_FILE, newline='') as csvfile:
         reader = csv.DictReader(csvfile)
         for row in reader:
-            stocks.append((MarketFeed.NSE_FNO, str(row["security_id"]), MarketFeed.Quote))
+            exch = row.get("exchange")
+            seg = row.get("segment")
+            instr = row.get("instrument")
+            sec_id = str(row["security_id"])
+            # Map to MarketFeed enums/constants
+            if exch == "NSE" and seg == "D":
+                stocks.append((MarketFeed.NSE_FNO, sec_id, MarketFeed.Quote))
+            elif exch == "MCX" and seg == "M":
+                stocks.append(("MCX_COMM", sec_id, MarketFeed.Quote))  # Use string for MCX
     return stocks
 
 instrument_list = get_instrument_list()
