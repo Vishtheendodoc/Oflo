@@ -1,4 +1,4 @@
-from flask import Flask, render_template, jsonify, request
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 import threading
 import time
@@ -8,15 +8,17 @@ import csv
 from collections import defaultdict
 import math
 from dhanhq import DhanContext, MarketFeed
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import pandas as pd
+import os
 
 # --- CONFIG ---
 API_BATCH_SIZE = 5          # Number of stocks per batch API call
 BATCH_INTERVAL_SEC = 5      # Wait time between batches
 RESET_TIME = "09:15"        # Clear delta_history daily at this time
 STOCK_LIST_FILE = "stock_list.csv"
-DB_FILE = "orderflow_data.db"
+POSTGRES_URL = os.environ.get("DATABASE_URL", "postgres://user:password@host:5432/dbname")  # Replace fallback with your DB URL
 
 # --- FLASK SETUP ---
 app = Flask(__name__)
@@ -32,6 +34,10 @@ CLIENT_ID = "1100244268"
 ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzUzODUzOTQxLCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwMDI0NDI2OCJ9.DsXutZuv9qIh4MNpMrfjIccyWg_-nwR9t5ldK0H14aGY23U7IaFW6cTmXp1MAr8zjk7eAIYNe-SVLv19Skw4MQ"
 analyzer = OrderFlowAnalyzer(CLIENT_ID, ACCESS_TOKEN)
 
+# PostgreSQL connection helper
+def get_db_connection():
+    return psycopg2.connect(POSTGRES_URL, cursor_factory=RealDictCursor)
+
 # Prepare instrument list from your stock_list.csv
 def get_instrument_list():
     stocks = []
@@ -42,66 +48,59 @@ def get_instrument_list():
             seg = row.get("segment")
             instr = row.get("instrument")
             sec_id = str(row["security_id"])
-            # Map to MarketFeed enums/constants
             if exch == "NSE" and seg == "D":
                 stocks.append((MarketFeed.NSE_FNO, sec_id, MarketFeed.Quote))
             elif exch == "MCX" and seg == "M":
-                stocks.append(("MCX_COMM", sec_id, MarketFeed.Quote))  # Use string for MCX
+                stocks.append(("MCX_COMM", sec_id, MarketFeed.Quote))
     return stocks
 
 instrument_list = get_instrument_list()
-
 dhan_context = DhanContext(CLIENT_ID, ACCESS_TOKEN)
 market_feed = MarketFeed(dhan_context, instrument_list, "v2")
 
+# Initialize PostgreSQL table
 def init_db():
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS orderflow (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                security_id TEXT,
-                timestamp TEXT,
-                buy_volume REAL,
-                sell_volume REAL,
-                ltp REAL,
-                volume REAL
-            )
-        ''')
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS orderflow (
+                    id SERIAL PRIMARY KEY,
+                    security_id TEXT,
+                    timestamp TIMESTAMP,
+                    buy_volume REAL,
+                    sell_volume REAL,
+                    ltp REAL,
+                    volume REAL
+                )
+            ''')
+            conn.commit()
+    print("✅ PostgreSQL table initialized")
+
 init_db()
 
+# Store quote data in PostgreSQL
 def store_in_db(security_id, timestamp, buy, sell, ltp, volume):
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.execute(
-            "INSERT INTO orderflow (security_id, timestamp, buy_volume, sell_volume, ltp, volume) VALUES (?, ?, ?, ?, ?, ?)",
-            (security_id, timestamp, buy, sell, ltp, volume)
-        )
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute('''
+                    INSERT INTO orderflow (security_id, timestamp, buy_volume, sell_volume, ltp, volume)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                ''', (security_id, timestamp, buy, sell, ltp, volume))
+                conn.commit()
+    except Exception as e:
+        print(f"[DB ERROR] Failed to insert data: {e}")
 
 def marketfeed_thread():
     while True:
         try:
             market_feed.run_forever()
-            # Continuously fetch and update live_market_data and orderflow_history
             while True:
                 response = market_feed.get_data()
-                #print("Raw response from market feed:", response)  # Log the raw data
-
                 if response and isinstance(response, dict):
-                    required_keys = ["security_id"]  # Add more keys as needed
-                    for key in required_keys:
-                        if key not in response:
-                            print(f"Error: Missing key '{key}' in response: {response}")
                     security_id = str(response.get("security_id"))
-                    if not security_id:
-                        print("Warning: security_id missing in response:", response)
-                    #else:
-                        print(f"Parsed security_id: {security_id}, data: {response}")  # Log parsed data
-
                     if security_id:
                         live_market_data[security_id] = response
-                        if security_id not in orderflow_history:
-                            orderflow_history[security_id] = []
-                        orderflow_history[security_id].append(response)
-                        # Store Quote Data in DB
                         if response.get('type') == 'Quote Data':
                             ltt = response.get("LTT")
                             today = datetime.now().strftime('%Y-%m-%d')
@@ -113,21 +112,18 @@ def marketfeed_thread():
                             store_in_db(security_id, timestamp, buy, sell, ltp, volume)
                 time.sleep(0.01)
         except Exception as e:
-            print(f"[ERROR] Marketfeed thread crashed: {e}. Restarting thread...")
+            print(f"[ERROR] Marketfeed thread crashed: {e}. Restarting...")
             time.sleep(2)
 
-# Start the market feed in a background thread
 threading.Thread(target=marketfeed_thread, daemon=True).start()
 
 def maybe_reset_history():
     now = datetime.now()
     today_str = now.strftime('%Y-%m-%d')
-
     if last_reset_date[0] != today_str and now.strftime('%H:%M') >= RESET_TIME:
         delta_history.clear()
         last_reset_date[0] = today_str
         print(f"🧹 Cleared delta history at {now.strftime('%H:%M:%S')}")
-
 
 def load_stock_list():
     stocks = []
@@ -138,54 +134,35 @@ def load_stock_list():
     print(f"📃 Loaded {len(stocks)} stocks from {STOCK_LIST_FILE}")
     return stocks
 
-
 @app.route('/api/delta_data/<string:security_id>')
 def get_delta_data(security_id):
+    interval = int(request.args.get('interval', 5))
     try:
-        interval = int(request.args.get('interval', 5))
-    except Exception:
-        interval = 5
-    # Query from SQLite DB
-    with sqlite3.connect(DB_FILE) as conn:
-        df = pd.read_sql_query(
-            "SELECT * FROM orderflow WHERE security_id = ? ORDER BY timestamp ASC",
-            conn, params=(security_id,)
-        )
-    if df.empty:
+        with get_db_connection() as conn:
+            df = pd.read_sql(
+                "SELECT * FROM orderflow WHERE security_id = %s ORDER BY timestamp ASC",
+                conn, params=(security_id,)
+            )
+        if df.empty:
+            return jsonify([])
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        buckets = []
+        grouped = df.groupby(pd.Grouper(key='timestamp', freq=f'{interval}min'))
+        for bucket_label, group in grouped:
+            if not group.empty:
+                buy_delta = group['buy_volume'].sum()
+                sell_delta = group['sell_volume'].sum()
+                delta = buy_delta - sell_delta
+                buckets.append({
+                    'timestamp': bucket_label.strftime('%H:%M'),
+                    'buy_volume': buy_delta,
+                    'sell_volume': sell_delta,
+                    'delta': delta
+                })
+        return jsonify(buckets)
+    except Exception as e:
+        print(f"[API ERROR] Failed to fetch delta data: {e}")
         return jsonify([])
-    # Convert timestamp to datetime if needed
-    if not pd.api.types.is_datetime64_any_dtype(df['timestamp']):
-        try:
-            df['timestamp'] = pd.to_datetime(df['timestamp'], format='%Y-%m-%d %H:%M:%S', errors='coerce')
-            df = df.dropna(subset=['timestamp'])
-        except Exception:
-            pass
-    df['minute'] = df['timestamp'].dt.strftime('%H:%M')
-    buckets = []
-    grouped = df.groupby(pd.Grouper(key='timestamp', freq=f'{interval}min'))
-    for bucket_label, group in grouped:
-        if len(group) >= 2:
-            start = group.iloc[0]
-            end = group.iloc[-1]
-            buy_delta = end['buy_volume'] - start['buy_volume']
-            sell_delta = end['sell_volume'] - start['sell_volume']
-            delta = buy_delta - sell_delta
-            buckets.append({
-                'timestamp': bucket_label.strftime('%H:%M'),
-                'buy_volume': buy_delta,
-                'sell_volume': sell_delta,
-                'delta': delta
-            })
-        elif len(group) == 1:
-            row = group.iloc[0]
-            buckets.append({
-                'timestamp': bucket_label.strftime('%H:%M'),
-                'buy_volume': 0,
-                'sell_volume': 0,
-                'delta': 0
-            })
-    return jsonify(buckets)
-
 
 @app.route('/api/stocks')
 def get_stock_list():
@@ -195,27 +172,22 @@ def get_stock_list():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
 @app.route('/api/live_data/<string:security_id>')
 def get_live_data(security_id):
     data = live_market_data.get(security_id)
-    #print(f"API /api/live_data/{security_id} response: {data}")  # Log API output
     if data:
         return jsonify(data)
     else:
         return jsonify({"error": "No live data"}), 404
-
 
 @app.route('/api/orderflow_history/<string:security_id>')
 def get_orderflow_history(security_id):
     data = orderflow_history.get(security_id, [])
     return jsonify(data)
 
-
 @app.route('/')
 def dashboard():
     return "<h1>Order Flow Flask Server Running</h1>"
-
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
