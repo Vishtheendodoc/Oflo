@@ -3,3 +3,5 @@ flask-cors
 pandas
 websocket-client
 git+https://github.com/dhan-oss/DhanHQ-py.git@main#egg=dhanhq
+psycopg2-binary
+
