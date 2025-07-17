@@ -83,7 +83,7 @@ def marketfeed_thread():
             # Continuously fetch and update live_market_data and orderflow_history
             while True:
                 response = market_feed.get_data()
-                print("Raw response from market feed:", response)  # Log the raw data
+                #print("Raw response from market feed:", response)  # Log the raw data
 
                 if response and isinstance(response, dict):
                     required_keys = ["security_id"]  # Add more keys as needed
@@ -93,7 +93,7 @@ def marketfeed_thread():
                     security_id = str(response.get("security_id"))
                     if not security_id:
                         print("Warning: security_id missing in response:", response)
-                    else:
+                    #else:
                         print(f"Parsed security_id: {security_id}, data: {response}")  # Log parsed data
 
                     if security_id:
