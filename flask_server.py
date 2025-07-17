@@ -199,7 +199,7 @@ def get_stock_list():
 @app.route('/api/live_data/<string:security_id>')
 def get_live_data(security_id):
     data = live_market_data.get(security_id)
-    print(f"API /api/live_data/{security_id} response: {data}")  # Log API output
+    #print(f"API /api/live_data/{security_id} response: {data}")  # Log API output
     if data:
         return jsonify(data)
     else:
