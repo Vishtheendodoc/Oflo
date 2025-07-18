@@ -27,6 +27,9 @@ analyzer = None
 delta_history = defaultdict(lambda: defaultdict(lambda: {'buy': 0, 'sell': 0}))
 last_reset_date = [None]  # For daily reset
 
+# Track previous LTP for tick-rule logic
+prev_ltp = defaultdict(lambda: None)
+
 # --- Initialize Dhan API Analyzer ---
 CLIENT_ID = "1100244268"
 ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzUzODUzOTQxLCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwMDI0NDI2OCJ9.DsXutZuv9qIh4MNpMrfjIccyWg_-nwR9t5ldK0H14aGY23U7IaFW6cTmXp1MAr8zjk7eAIYNe-SVLv19Skw4MQ"
@@ -64,16 +67,19 @@ def init_db():
                 buy_volume REAL,
                 sell_volume REAL,
                 ltp REAL,
-                volume REAL
+                volume REAL,
+                buy_initiated REAL,
+                sell_initiated REAL,
+                tick_delta REAL
             )
         ''')
 init_db()
 
-def store_in_db(security_id, timestamp, buy, sell, ltp, volume):
+def store_in_db(security_id, timestamp, buy, sell, ltp, volume, buy_initiated=None, sell_initiated=None, tick_delta=None):
     with sqlite3.connect(DB_FILE) as conn:
         conn.execute(
-            "INSERT INTO orderflow (security_id, timestamp, buy_volume, sell_volume, ltp, volume) VALUES (?, ?, ?, ?, ?, ?)",
-            (security_id, timestamp, buy, sell, ltp, volume)
+            "INSERT INTO orderflow (security_id, timestamp, buy_volume, sell_volume, ltp, volume, buy_initiated, sell_initiated, tick_delta) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (security_id, timestamp, buy, sell, ltp, volume, buy_initiated, sell_initiated, tick_delta)
         )
 
 def marketfeed_thread():
@@ -83,7 +89,7 @@ def marketfeed_thread():
             # Continuously fetch and update live_market_data and orderflow_history
             while True:
                 response = market_feed.get_data()
-                #print("Raw response from market feed:", response)  # Log the raw data
+                print("Raw response from market feed:", response)  # Log the raw data
 
                 if response and isinstance(response, dict):
                     required_keys = ["security_id"]  # Add more keys as needed
@@ -93,7 +99,7 @@ def marketfeed_thread():
                     security_id = str(response.get("security_id"))
                     if not security_id:
                         print("Warning: security_id missing in response:", response)
-                    #else:
+                    else:
                         print(f"Parsed security_id: {security_id}, data: {response}")  # Log parsed data
 
                     if security_id:
@@ -110,7 +116,20 @@ def marketfeed_thread():
                             sell = response.get("total_sell_quantity", 0)
                             ltp = response.get("LTP", 0)
                             volume = response.get("volume", 0)
-                            store_in_db(security_id, timestamp, buy, sell, ltp, volume)
+                            ltq = response.get("LTQ", 0)
+                            # Tick-rule logic
+                            prev = prev_ltp[security_id]
+                            buy_initiated = 0
+                            sell_initiated = 0
+                            if prev is not None and ltq:
+                                if ltp > prev:
+                                    buy_initiated = ltq
+                                elif ltp < prev:
+                                    sell_initiated = ltq
+                                # else: unchanged, both 0
+                            tick_delta = buy_initiated - sell_initiated
+                            prev_ltp[security_id] = ltp
+                            store_in_db(security_id, timestamp, buy, sell, ltp, volume, buy_initiated, sell_initiated, tick_delta)
                 time.sleep(0.01)
         except Exception as e:
             print(f"[ERROR] Marketfeed thread crashed: {e}. Restarting thread...")
@@ -170,19 +189,57 @@ def get_delta_data(security_id):
             buy_delta = end['buy_volume'] - start['buy_volume']
             sell_delta = end['sell_volume'] - start['sell_volume']
             delta = buy_delta - sell_delta
+            # Tick-rule aggregation
+            buy_initiated_sum = group['buy_initiated'].sum()
+            sell_initiated_sum = group['sell_initiated'].sum()
+            tick_delta_sum = group['tick_delta'].sum()
+            # Inference
+            threshold = 0  # You can adjust this if needed
+            if tick_delta_sum > threshold:
+                inference = "Buy Dominant"
+            elif tick_delta_sum < -threshold:
+                inference = "Sell Dominant"
+            else:
+                inference = "Neutral"
+            # OHLC from LTP
+            ohlc = group['ltp'].dropna()
+            if not ohlc.empty:
+                open_ = ohlc.iloc[0]
+                high_ = ohlc.max()
+                low_ = ohlc.min()
+                close_ = ohlc.iloc[-1]
+            else:
+                open_ = high_ = low_ = close_ = None
             buckets.append({
                 'timestamp': bucket_label.strftime('%H:%M'),
                 'buy_volume': buy_delta,
                 'sell_volume': sell_delta,
-                'delta': delta
+                'delta': delta,
+                'buy_initiated': buy_initiated_sum,
+                'sell_initiated': sell_initiated_sum,
+                'tick_delta': tick_delta_sum,
+                'inference': inference,
+                'open': open_,
+                'high': high_,
+                'low': low_,
+                'close': close_
             })
         elif len(group) == 1:
             row = group.iloc[0]
+            ohlc = row['ltp'] if pd.notnull(row['ltp']) else None
             buckets.append({
                 'timestamp': bucket_label.strftime('%H:%M'),
                 'buy_volume': 0,
                 'sell_volume': 0,
-                'delta': 0
+                'delta': 0,
+                'buy_initiated': 0,
+                'sell_initiated': 0,
+                'tick_delta': 0,
+                'inference': 'Neutral',
+                'open': ohlc,
+                'high': ohlc,
+                'low': ohlc,
+                'close': ohlc
             })
     return jsonify(buckets)
 
@@ -199,7 +256,7 @@ def get_stock_list():
 @app.route('/api/live_data/<string:security_id>')
 def get_live_data(security_id):
     data = live_market_data.get(security_id)
-    #print(f"API /api/live_data/{security_id} response: {data}")  # Log API output
+    print(f"API /api/live_data/{security_id} response: {data}")  # Log API output
     if data:
         return jsonify(data)
     else:
